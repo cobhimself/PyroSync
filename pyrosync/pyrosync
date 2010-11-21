@@ -1,0 +1,663 @@
+#!/usr/bin/python
+"""
+Pyrosync is a Python wrapper for rsync that allows the saving of preset rsync
+commands. These commands are saved as a config file in the user's home directory.
+
+This script takes care of checking the syntax of the user's input in regards to
+itself. It DOES NOT check to see if the commands sent to rsync are dangerous or
+incorrect. It's possible this will be implemented in a future version. Please be
+careful using rsync!
+
+TODO:
+    X Allow multiple preset deletions at the same time
+    X Add -a to be equal to --n
+    - Verify file paths during creation
+    X Allow multiple presets to be run at the same time
+    - Allow the user to delete the config file
+    X Allow the user to preview the rsync command
+    X Make the error, debug and warning functions one function
+
+Copyright (C) 2009 Collin D. Brooks.
+
+Thanks goes out to my wife for allowing me to spend a lot of my free time on this
+I LOVE YOU BABE!
+
+CODE LICENSE:
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+CONTENT LICENSE:
+
+This work is licensed under the Creative Commons Attribution-Share Alike 3.0
+Unported License. To view a copy of this license, visit
+
+   http://creativecommons.org/licenses/by-sa/3.0/
+
+or send a letter to:
+
+    Creative Commons
+    171 Second Street, Suite 300
+    San Francisco, California, 94105, USA.
+"""
+
+
+__author__ = "Collin D. Brooks <Collin.Brooks@gmail.com>"
+__date__ = "Aug 15, 2009 9:57:47 PM$"
+__script__ = "pyrosync"
+__version__ = "1.0"
+
+import ConfigParser
+import os
+import sys
+import getopt
+from string import Template
+import PyrosyncPreset
+
+
+"""
+GLOBAL VARIABLES:
+_verb               Holds the name of the verb the user has decided to run.
+                    It defaults to "run" so the preset name to run can be
+                    specified without having to worry about the -p command.
+_verb_list          A list of the verbs (or functions) that are available
+                    to be run.
+_preset_name        The name of the first preset passed from the commandline.
+_preset_file_path   The path to the presets config file.
+_presets            Dictionary of the defined presets. The preset names are
+                    used as the keys.
+_list_strength      The more 'l' arguments sent, the more in-depth the
+                    list output is. 1 for preset names only, 2 for preset
+                    properties and 3 for 2 plus rsync command.
+_debug              Boolean used to determine whether or not to display debug
+                    information.
+_assume_yes         Boolean used to determine whether or not the user wants to be
+                    asked for confirmation before sensitive operations.
+_debug_prefix       Text to go before a debug message.
+_error_prefix       Text to go before an error message.
+_warn_prefix        Text to go before a warning message.
+_info_prefix        Text to go before a info message.
+_message_nl_indent  String used to indent screen output to where any output that
+                    has been prefixed with ERROR, DEBUG, or WARNING would start.
+"""
+
+_verb = "run"
+_verb_list = ["run", "edit", "list", "new", "delete", "preview", "purge"]
+_preset_name = ''
+_preset_file_path = os.path.expanduser('~/.pyrosync_presets.cfg')
+_presets = {}
+_list_strength = 0
+
+#Output handling variables
+_debug = True
+_assume_yes = False
+_debug_prefix = __script__ + "   DEBUG: "
+_error_prefix = __script__ + "   ERROR: "
+_warn_prefix =  __script__ + " WARNING: "
+_message_nl_indent = "                  "
+
+#Options to be used with getopt
+_short_args = "p:a:n:d:le:hY"
+_long_args = ['preview=', 'add=', 'new=', 'delete=', 'list', 'edit=', 'help', 'assume-yes', 'purge']
+
+def usage():
+    """Outputs the script's help documentation"""
+    print __script__ + " " + __version__ + " Help:"
+    print \
+            """
+pyrosync is a wrapper for the rsync command line utility that allows you
+to save preset rsync commands that you can run again in the future.
+
+    pyrosync.py [OPTIONS] presetName(s)
+    pyrosync.py [OPTIONS] [-p | --preview] presetName(s)
+    pyrosync.py [OPTIONS] [-n | --new] presetName
+    pyrosync.py [OPTIONS] [-n | --new] presetName "Description" /Src/ /Dest/ [rsync options]
+    pyrosync.py [OPTIONS] [-d | --delete] presetName(s)
+    pyrosync.py [OPTIONS] [-e | --edit] presetName
+    pyrosync.py [OPTIONS] [-l | --list]
+    pyrosync.py --purge
+    pyrosync.py [-h | --help]
+
+OPTIONS:
+    -h, --help              Displays this usage information
+    -p, --preview           Outputs the rsync command that will be run by
+                            this preset.
+    -n, --new               Create a new preset
+    -a, --add               Same as -n and --new
+    -d, --delete            Delete the specificed preset
+    -e, --edit              Edit the specified preset
+    -l, --list              List available presets
+    -Y, --assume-yes        Automatically assume Y at any prompt for
+                            verification. This is helpful for batch scripts.
+                            NOTE: This only applies to the pyrosync script.
+                            It does automatically add this functionality to
+                            the rsync command.
+
+See the man page for examples and more help. Run 'man rsync' for rsync help.
+
+Pyrosync is distributed in an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ANY KIND, either express or implied. See the Apache 2.0 License for more info.
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+    """
+
+def quotify_argument(theArg):
+    """
+    Take an argument string that has an equal sign in it and add quotes around
+    the value that the argument is being assigned.
+
+    This function takes an argument string such as:
+        '--exclude=This is a value to exclude'
+    and turns it into:
+        '--exclude="This is a value to exclude"'
+
+    If the value that comes afte the equal sign does not have spaces, the
+    quotes are not added.
+    """
+
+    ePos = theArg.find('=') #Find the position of the equal sign
+
+    if ' ' in theArg[ePos:]:
+        #Add the quotes to the argument
+        theArg=theArg[:ePos]+theArg[ePos]+'"'+theArg[ePos+1:]+'"'
+    return theArg
+
+def do_output(the_string,  error_severity='BLANK', error_code=1):
+    """
+    This method is called with various types of messages as well as various
+    types of severity. The severity types are:
+    BLANK, INFO, DEBUG, ERROR, WARNING
+    """
+
+    global _error_prefix
+    global _warn_prefix
+    global _debug_prefix
+    global _info_prefix
+    global _debug
+
+    if error_severity == 'ERROR':
+        print _error_prefix + the_string
+        #ERROR messages will exit
+        sys.exit(error_code)
+    elif error_severity == 'BLANK':
+        print the_string
+    elif error_severity == 'INFO':
+        print the_string
+    elif error_severity == 'DEBUG' and _debug:
+        print _debug_prefix + the_string
+    elif error_severity == 'WARNING':
+        print _warn_prefix + the_string
+
+def whereis(program):
+    """Searches to make sure the given program exists on the system"""
+    for path in os.environ.get('PATH', '').split(':'):
+        if os.path.exists(os.path.join(path, program)) and \
+        not os.path.isdir(os.path.join(path, program)):
+            return os.path.join(path, program)
+    return None
+
+def raw_default(prompt, dflt=None):
+    """Provides a default value for the raw_input function"""
+    if dflt:
+        prompt = "%s [%s]: " % (prompt, dflt)
+    res = raw_input(prompt)
+    if not res and dflt:
+        return dflt
+    return res
+
+def load_presets():
+    """Loads the presets into the _presets dictionary.
+       This must run before any operation can be done on the presets.
+    """
+    global _presets
+    global _preset_file_path
+
+    do_output("Loading presets from " + _preset_file_path, "DEBUG")
+
+    #Verify the preset file actually exists
+    if os.path.isfile(_preset_file_path) != True:
+        do_output("The preset file does not exist", "DEBUG")
+        #The preset file does not exist
+        return False
+    else:
+        #Create the config parser object
+        config = ConfigParser.RawConfigParser()
+
+        #read the preset file located within the home directory for this user
+        config.read(_preset_file_path)
+
+        #populate the _presets with the sections (or presets) that are available
+        config_presets = config.sections()
+        do_output("Current config sections: " + str(config_presets), "DEBUG")
+
+        #Create the Presets and attatch options to each preset within the _presets
+        for preset in config_presets:
+            _presets[preset] = PyrosyncPreset.Preset(preset)
+            _presets[preset].set_description(config.get(preset, 'description'))
+            _presets[preset].set_options(config.get(preset, 'options'))
+            _presets[preset].set_source(config.get(preset, 'source'))
+            _presets[preset].set_destination(config.get(preset, 'destination'))
+            do_output("Loaded preset "+preset, "DEBUG")
+        do_output("All presets loaded successfully", "DEBUG")
+        return True
+
+def save_presets():
+    """Saves the presets into the config file"""
+    global _presets
+    global _preset_file_path
+
+    #See if the preset file path exists
+
+    do_output("Saving the presets to " + _preset_file_path, "DEBUG")
+
+    #Create the config parser object
+    config = ConfigParser.RawConfigParser()
+
+    #Loop through the presets dictionary and get the data to save into the config
+    for preset in _presets:
+        do_output("Current preset to save: " + preset, "DEBUG")
+        #Add the preset as a section to the config file
+        config.add_section(preset)
+        config.set(preset, 'description', _presets[preset].get_description())
+        config.set(preset, 'options', _presets[preset].get_options())
+        config.set(preset, 'source', _presets[preset].get_source())
+        config.set(preset, 'destination', _presets[preset].get_destination())
+
+    #with open(_preset_file_path, 'wb') as configfile:
+    #    config.write(configfile)
+    configfile = open(_preset_file_path, 'wb')
+    try:
+        config.write(configfile)
+        do_output("Presets successfully saved!", "INFO")
+    finally:
+        configfile.close()
+
+def preset_exists(p):
+    """Checks to see if the given preset actually exists"""
+    if p in _presets.keys():
+        return True
+    else:
+        return False
+
+def add_preset(p, args=[], long_form_options=[]):
+    """Add one or more presets to the _presets dictionary"""
+    #TODO
+    # make sure the paths exists
+
+    do_output('Num arguments: '+str(len(args)), "DEBUG")
+    do_output('Long Form Options: ' + str(long_form_options), "DEBUG")
+
+    #Make sure the preset isn't already defined
+    if preset_exists(p):
+        do_output('The preset '+p+' already exists!', "ERROR")
+    else:
+        #In order to allow the user to specify a new preset in one command,
+        #the options have to come after all of the other arguments to allow
+        #for the use of dashes. We need to check to see if the user has used the
+        #long form of adding a new preset and, if they have, take the options as
+        #the arguments after the source, destination and description arguments.
+
+        #Did the user use the long form?
+        if len(args) != 0:
+            source = args[0]
+            destination = args[1]
+            description = args[2]
+            #Quotify the long form options
+            long_form_options=map(quotify_argument, long_form_options)
+
+            #Join the long form options as a string
+            options = ' '.join(map(str, long_form_options))
+        else:
+            #Ask the user for the information
+            print "Please assign the following for the preset " + p + "\n"
+            options = raw_input("Options:\n")
+            source = raw_input("Source:\n")
+            destination = raw_input("Destination:\n")
+            description = raw_input("Description:\n")
+
+        _presets[p] = PyrosyncPreset.Preset(p)
+        _presets[p].set_description(description)
+        _presets[p].set_options(options)
+        _presets[p].set_source(source)
+        _presets[p].set_destination(destination)
+
+        do_output("Preset Name: " + p, "DEBUG")
+        do_output("Description: " + _presets[p].get_description(), "DEBUG")
+        do_output("Options: " + _presets[p].get_options(), "DEBUG")
+        do_output("Source: " + _presets[p].get_source(), "DEBUG")
+        do_output("Destination: " + _presets[p].get_destination(), "DEBUG")
+
+        #Save the presets!
+        save_presets()
+
+def delete_preset(p, args=None):
+    """
+    Deletes the sent preset
+
+    Since the the delete option requires at least one preset to delete, the
+    first (and possibly only) preset that the user inputs is represented by p.
+    Any presets added after the initial preset are contained within the args
+    variable. If you are going to see how many presets were sent to delete,
+    make sure to always add one for the required first preset name.
+    """
+    #List of the presets that were deleted
+    deleted = []
+
+    #The warning string used to let the user know of certain presets that couldn't
+    #be deleted because they don't exist
+    warning = "The following presets don't exist:\n"
+
+    #Keeps track of whether or not we need to output a warning about certain
+    #presets not existing
+    nonExistantPresetFound = False
+
+    #See how many presets we are deleting. We add one because of the defualt
+    #preset p
+    numDelete = len(args) + 1
+
+    if not _assume_yes:
+        #Generate the question string
+        s = "Are you sure you want to delete "
+        if numDelete ==1:
+            #There is only one preset so list only the sent preset
+            s += "the preset "+p+"?\n"
+        if numDelete >1:
+            #There are more than one presets sent to this function so output a list
+            s += "the following presets?\n"
+
+            #-d's default argument is passed to this function as p. Output it before
+            #the other presets sent through the arguments
+            s += p + "\n"
+
+            #Output the presets sent through the arguments
+            for i in args:
+                s += i+"\n"
+
+        #Print the question string we just created
+        do_output(s)
+        #Ask the user if they really want to delete the preset(s)
+        yes = raw_input("Type (Y)es or (N)o: ") in ("y", "Y", "Yes", "yes")
+    else:
+        do_output("Assuming yes for deletion...")
+        yes = True
+
+    if yes:
+        #-d requires at least one preset. This function recieves this preset as
+        #the variable p. Delete this first and then loop through the rest of
+        #the presets that are contained within the args variable
+        del _presets[p]
+        deleted.append(p)
+        for i in args:
+            if preset_exists(i):
+                do_output("Deleting preset: " + i, "DEBUG")
+                del _presets[i]
+                deleted.append(i)
+            else:
+                nonExistantPresetFound = True
+                do_output("Non existant preset: " + i, "DEBUG")
+                warning += "\t" + i + "\n"
+
+        do_output("The deletion of the following preset(s) was successful:")
+        for i in deleted: do_output("\t" + i)
+
+        if nonExistantPresetFound:
+            do_output(warning, "WARNING")
+
+        #Save the presets only if the user said yes to deleting the preset
+        save_presets()
+
+def edit_preset(p):
+    """Edits the passed preset"""
+    do_output(Template('Current information for preset $pre:\n\tDescription: $description\n\tOptions: $options\n\tSource: $source\n\tDestination: $destination')\
+            .substitute(pre=p,
+                description=_presets[p].get_description(),
+                options=_presets[p].get_options(),
+                source=_presets[p].get_source(),
+                destination=_presets[p].get_destination()), "DEBUG")
+    print\
+    """
+    Enter in the information required below. If you want to stick with
+    the settings you already have (displayed within the []),
+    enter nothing and press return.
+    """
+
+    #Grab the user's input
+
+    description = raw_default("Description",_presets[p].get_description())
+    options = raw_default("Options",_presets[p].get_options())
+    source = raw_default("Source",_presets[p].get_source())
+    destination = raw_default("Destination",_presets[p].get_destination())
+
+    #Modify the preset's data
+    _presets[p].set_description(description)
+    _presets[p].set_options(options)
+    _presets[p].set_source(source)
+    _presets[p].set_destination(destination)
+
+    #Save the presets!
+    save_presets()
+
+def list_presets():
+    """
+    Generate a listing of the current presets
+
+    If the user specified the -l option twice, output more info about the presets
+    """
+    global _presets
+    global _list_strength
+
+    do_output("Listing the presets", "DEBUG")
+    do_output(str(_presets), "DEBUG")
+    if _list_strength > 1:
+        s = '$pre - $description\n\n\
+                Options:      $options\n\
+                Source:       $source\n\
+                Destination:  $destination\n'
+        if _list_strength > 2:
+            s += '    Rsync Command: rsync $options $source $destination\n'
+    else:
+        print "PRESETS:"
+        s = '\t$pre'
+
+    if len(_presets) != 0:
+        for preset in _presets:
+            print Template(s)\
+                    .substitute(pre=preset,
+                            description=_presets[preset].get_description(),
+                            options=_presets[preset].get_options(),
+                            source=_presets[preset].get_source(),
+                            destination=_presets[preset].get_destination())
+    else:
+        do_output("You do not currently have any presets defined!")
+
+def preview_preset(p1, presets):
+    """Generate the rsync command for the user to preview"""
+    #Define a template rsync command string
+    rsyncCommand = "rsync $options $source $destination\n"
+
+    print "The following rsync commands would have been run:"
+
+    #Because there can be one or more presets given to the -p verb,
+    #We need to add the first one (given to this function as p1) to the list
+    #Of arguments arguments added after -p presetName.
+
+    presets[1:1] = [p1]
+
+    #Run the presets
+    for p in presets:
+        if preset_exists(p):
+            do_output("Running preset " + p, "INFO")
+            print Template("PRESET: " + p + "\n" + rsyncCommand)\
+                    .substitute(options=_presets[p].get_options(),
+                            source=_presets[p].get_source(),
+                            destination=_presets[p].get_destination())
+        else:
+            do_output("Preset " + p + " does not exists... SKIPPING", "WARNING")
+    pass
+
+def run_preset(presets):
+    """Run the preset(s) specified"""
+    for p in presets:
+        if preset_exists(p):
+            do_output("Running preset " + p, "INFO")
+            #TODO Run the preset
+        else:
+            do_output("Preset " + p + " does not exists... SKIPPING", "WARNING")
+
+def purge_config():
+    """Delete the configuration file"""
+    global _assume_yes
+
+    if not _assume_yes:
+        answer = raw_default("Are you sure you want to purge "\
+                +"(delete) all your presets?", "Y")
+    else:
+        answer = "Y"
+
+    if answer in ("Y", "y", "Yes", "yes"):
+        os.remove(_preset_file_path)
+        do_output("Presets deleted successfully!", "INFO")
+
+def main(argv):
+    """Takes the arguments from the command line to do what the users wants to"""
+
+    #Grab globals
+    global _preset_name
+    global _verb
+    global _preset_file
+    global _presets
+    global _short_args
+    global _long_args
+    global _assume_yes
+    global _list_strength
+
+    #First, we need to make sure the rsync utility can be found
+    if whereis('rsync') == False:
+        err('', 'Cannot find the rsync utility')
+
+    #Second, we need to make sure arguments were passed
+    if len(argv) == 0:
+        do_output("No arguments... showing usage", "DEBUG")
+        usage()
+        sys.exit(2)
+
+    #Grab the passed arguments
+    try:
+        do_output("Passed arguments: " + str(argv), "DEBUG")
+
+        #The -n, -a, --new, --add options allow for a long form that defines a
+        #new preset in one command. This command tacs on the preset options at
+        #the end and getopt will try to parse these arguments. Therefore, we
+        #need to see if the user submitted a long form version of the add
+        #command and then store it in a variable to be passed later on to the
+        #add_preset function
+        if(argv[0] in ["-n", "-a", "--new","--add"]):
+            #Grab the option arguments
+            add_long_form_options = argv[5:]
+            #Remove the options from the arguments
+            del argv[5:]
+            do_output("Argv modified: "+str(argv))
+        opts, args = getopt.gnu_getopt(argv, _short_args, _long_args)
+    except getopt.GetoptError, e:
+        #We've got an error; display usage information and then exit
+        do_output(str(e) + ". See pyrosync -h for help.", "ERROR", 2)
+
+    #Assign arguments to verbs
+    for opt, arg in opts:
+        if opt in ("-h", "--help"):
+            usage()
+            sys.exit()
+        elif opt in ("-d", "--delete"):
+            _verb = "delete"
+            _preset_name = arg
+        elif opt in ("-Y", "--assume-yes"):
+            _assume_yes = True
+        elif opt in ("-n", "--new", "-a", "--add"):
+            _verb = "new"
+            _preset_name = arg
+        elif opt in ("-e", "--edit"):
+            _verb = "edit"
+            _preset_name = arg
+        elif opt in ("-l", "--list"):
+            _verb = "list"
+            _list_strength = _list_strength + 1
+        elif opt in ("-p", "--preview"):
+            _verb = "preview"
+            _preset_name = arg
+        elif opt == "--purge":
+            _verb = "purge"
+
+        do_output("Verb: " + _verb, "DEBUG")
+        do_output("Preset Name: " + _preset_name, "DEBUG")
+
+    #Function call is after argument assignment so argument checking can happen
+
+    #Make sure we have recieved a proper verb call. This is an internal
+    #error check, not a user error check
+    if _verb not in _verb_list:
+        do_output("The verb " + _verb + " is not a default verb!", "ERROR")
+
+    #The verb we've recieved is ok, do some initial user error checking...
+    elif _verb != "list" and _preset_name == None:
+        do_output("You must specify a preset name. Please use pyrosync -h for help", "ERROR")
+        #The new verb can have a short and long representation:
+        #pyrosync -n presetName
+        #pyrosync -n presetName presetSource presetDestination presetDescription presetOptions
+        #
+        #Check to make sure the argument setup is valid
+    elif _verb == "new" and len(args) > 0:
+        #Arguments were passed... make sure they are within the number allowed.
+        #There should be 3 arguments passed: source, destination, description
+        if(len(args) != 3):
+            do_output("Arguments: "+str(args), "DEBUG")
+            do_output("You have an incorrect amountof arguments! The correct long form syntax is\n pyrosync -n presetName "\
+                    + "presetOptions presetSource presetDestination presetDescription", "ERROR")
+
+    #If the verb is not purge, the following error checks require the presets to
+    #Be loaded. So... load them
+    if _verb != "purge":
+        presets_loaded = load_presets()
+
+        #If the verb is anything other than new, we need to verify that the
+        #presets file actually exists
+        if _verb != "new" and presets_loaded == False:
+            do_output("You do not have any presets defined. Please add a preset.", "ERROR")
+        #If the verb is delete or edit, we need to check to see if
+        #the preset name passed actually exists.
+        #This error check doesn't apply to run so multiple presets can be given and
+        #Ran in batch files. The run_preset function checks to see if a preset exists
+        #Before it runs the preset.
+        if _verb in ("delete", "edit"):
+            #See if the preset we've been given actually exists
+            if preset_exists(_preset_name) != True:
+                do_output("A preset named " + _preset_name + " does not exist!", "ERROR")
+
+    #Done with inticial error checking. Run the user's desired verb
+    if _verb == "run":
+        run_preset(args)
+    elif _verb == "edit":
+        edit_preset(_preset_name)
+    elif _verb == "new":
+        add_preset(_preset_name, args, add_long_form_options)
+    elif _verb == "list":
+        list_presets()
+    elif _verb == "delete":
+        delete_preset(_preset_name, args)
+    elif _verb == "preview":
+        preview_preset(_preset_name, args)
+    elif _verb == "purge":
+        purge_config()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
